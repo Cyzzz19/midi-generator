@@ -114,21 +114,25 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
     top_k = min(top_k, logits.size(-1))  # Safety check
     if top_k > 0:
         # Remove all tokens with a probability less than the last token of the top-k
-        indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        # logits shape: (vocab_size,)
+        # We need to reshape for scatter operations if needed, but topk returns indices for the last dim
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][-1] # [0] are values, [1] are indices
         logits[indices_to_remove] = filter_value
 
     if top_p > 0.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True) # Both shape (vocab_size,)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) # shape (vocab_size,)
 
         # Remove tokens with cumulative probability above the threshold
-        sorted_indices_to_remove = cumulative_probs > top_p
-        # Shift the indices to the right to keep also the first token above the threshold
-        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-        sorted_indices_to_remove[..., 0] = 0
+        sorted_indices_to_remove = cumulative_probs > top_p # shape (vocab_size,)
 
-        # scatter sorted tensors to original indexing
-        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+        sorted_indices_to_remove[0] = 0
+
+        # Create a mask for original indices
+        indices_to_remove = torch.zeros_like(logits, dtype=torch.bool)
+        indices_to_remove.scatter_(0, sorted_indices, sorted_indices_to_remove)
         logits[indices_to_remove] = filter_value
     return logits
 
@@ -170,41 +174,41 @@ class TransformerMusic(nn.Module):
 
 # --- 生成函数 ---
 def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=0, top_p=0.0):
-    """
-    根据上下文 tokens 生成新的 tokens
-    """
     model.eval()
     device = next(model.parameters()).device
-    context_tensor = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(0) # (1, seq_len)
-    generated_tokens = context_tensor.clone()
+    
+    # Encoder 输入：原始上下文（固定）
+    src = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(0)  # (1, src_len)
+    
+    # Decoder 输入：从 <BOS> 开始
+    tgt = torch.tensor([BOS], dtype=torch.long, device=device).unsqueeze(0)  # (1, 1)
 
     for _ in tqdm(range(max_generate_tokens), desc="Generating"):
-        # 确保输入不超过模型最大长度
-        current_input = generated_tokens[:, -MAX_SEQ_LEN:]
-        tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(current_input.size(1)).to(device)
+        # 创建 decoder mask
+        tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(tgt.size(1)).to(device)
         
-        # 对于 Encoder-Decoder，src 和 tgt 是相同的
         with torch.no_grad():
-            outputs = model(current_input, current_input, tgt_mask=tgt_mask)
+            # 正确调用：src 固定，tgt 是已生成序列
+            output = model(src, tgt, tgt_mask=tgt_mask)
         
-        # 取最后一个时间步的预测
-        next_token_logits = outputs[0, -1, :] / temperature
+        # 预测下一个 token
+        next_token_logits = output[0, -1, :] / temperature
         filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
-        
-        # 采样下一个 token
         probs = torch.softmax(filtered_logits, dim=-1)
         next_token_id = torch.multinomial(probs, num_samples=1).item()
         
-        # 检查是否生成了 EOS
         if next_token_id == EOS:
             print("EOS token generated, stopping.")
             break
 
-        # 将新 token 添加到生成序列中
+        # 将新 token 添加到 tgt
         next_token_tensor = torch.tensor([[next_token_id]], dtype=torch.long, device=device)
-        generated_tokens = torch.cat((generated_tokens, next_token_tensor), dim=1)
+        tgt = torch.cat((tgt, next_token_tensor), dim=1)
 
-    return generated_tokens[0].cpu().tolist()
+    # 返回：原始上下文 + 生成部分（可选），或仅生成部分
+    # 这里我们返回完整的序列用于保存
+    full_sequence = torch.cat((src, tgt[:, 1:]), dim=1)  # 去掉 tgt 的 BOS 重复
+    return full_sequence[0].cpu().tolist()
 
 # --- 将生成的 tokens 转换为 MIDI 并保存 ---
 def tokens_to_midi(tokens, output_path, ticks_per_beat=480):
