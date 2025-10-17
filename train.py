@@ -7,11 +7,13 @@ import pretty_midi
 import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
+import multiprocessing as mp
 
 # --- 配置参数 ---
-ROOT_DIR = "path/to/your/midi/folder"  # 请替换为你的 MIDI 文件夹路径
+ROOT_DIR = "D:\maestro-v3.0.0"  # 请替换为你的 MIDI 文件夹路径
 MAX_SEQ_LEN = 512  # 模型一次处理的最大 token 长度
 SLIDE_STEP = 256   # 滑动窗口步长（非重叠为 MAX_SEQ_LEN）
+NUM_WORKERS = 16    # 用于预处理的进程数
 
 # --- 词表和特殊 token ---
 PAD = 0
@@ -86,12 +88,40 @@ def event_to_token(pitch, time_shift, duration):
         DURATION_OFFSET + dur
     ]
 
+# --- 用于多进程的辅助函数 ---
+def process_midi_file(args):
+    path, max_seq_len, slide_step = args
+    events = midi_to_events(path)
+    if events is not None and len(events) > 0:
+        # 将事件序列转换为 token 序列
+        tokens = [BOS]
+        for pitch, ts, dur in events:
+            tokens.extend(event_to_token(pitch, ts, dur))
+        tokens.append(EOS)
+        
+        # 滑动窗口切分
+        all_sequences = []
+        start = 0
+        while start < len(tokens):
+            end = start + max_seq_len
+            chunk = tokens[start:end]
+            if len(chunk) < max_seq_len:
+                chunk = chunk + [PAD] * (max_seq_len - len(chunk))
+            all_sequences.append(chunk)
+            start += slide_step
+            if start + max_seq_len > len(tokens):
+                if start < len(tokens):
+                    last_chunk = tokens[start:]
+                    last_chunk = last_chunk + [PAD] * (max_seq_len - len(last_chunk))
+                    all_sequences.append(last_chunk)
+                break
+        return all_sequences
+    return []
+
 # --- 数据集类 ---
 class MIDIDataset(Dataset):
-    def __init__(self, root_dir, max_seq_len, slide_step):
+    def __init__(self, root_dir, max_seq_len, slide_step, num_workers):
         self.max_seq_len = max_seq_len
-        self.slide_step = slide_step
-        self.all_tokenized_sequences = []
         
         # 递归搜索所有 .mid 文件
         file_paths = []
@@ -99,40 +129,22 @@ class MIDIDataset(Dataset):
             file_paths.extend(glob.glob(os.path.join(root_dir, '**', ext), recursive=True))
         print(f"Found {len(file_paths)} MIDI files.")
         
-        # 预处理所有 MIDI 文件
-        for path in tqdm(file_paths, desc="Preprocessing MIDI files"):
-            events = midi_to_events(path)
-            if events is not None and len(events) > 0:
-                # 将事件序列转换为 token 序列
-                tokens = [BOS]
-                for pitch, ts, dur in events:
-                    tokens.extend(event_to_token(pitch, ts, dur))
-                tokens.append(EOS)
-                
-                # 滑动窗口切分
-                self._add_sliding_sequences(tokens)
+        # 准备多进程参数
+        args_list = [(path, max_seq_len, slide_step) for path in file_paths]
+        
+        # 使用多进程池处理 MIDI 文件
+        print(f"Preprocessing MIDI files using {num_workers} processes...")
+        with mp.Pool(processes=num_workers) as pool:
+            # imap_unordered 可以在任务完成时立即获取结果，可能更快
+            results = list(tqdm(pool.imap_unordered(process_midi_file, args_list), total=len(args_list), desc="Processing MIDI files"))
+        
+        # 合并所有结果
+        self.all_tokenized_sequences = []
+        for result in results:
+            if result: # 检查是否有返回的序列
+                self.all_tokenized_sequences.extend(result)
         
         print(f"Generated {len(self.all_tokenized_sequences)} training sequences.")
-
-    def _add_sliding_sequences(self, full_tokens):
-        # 从头开始，每次滑动 slide_step 个 token
-        start = 0
-        while start < len(full_tokens):
-            end = start + self.max_seq_len
-            chunk = full_tokens[start:end]
-            if len(chunk) < self.max_seq_len:
-                # 如果不足 max_seq_len，填充 PAD
-                chunk = chunk + [PAD] * (self.max_seq_len - len(chunk))
-            self.all_tokenized_sequences.append(chunk)
-            start += self.slide_step
-            # 如果滑动后超出边界，则停止
-            if start + self.max_seq_len > len(full_tokens):
-                # 添加最后一个不足 max_seq_len 的 chunk
-                if start < len(full_tokens):
-                    last_chunk = full_tokens[start:]
-                    last_chunk = last_chunk + [PAD] * (self.max_seq_len - len(last_chunk))
-                    self.all_tokenized_sequences.append(last_chunk)
-                break
 
     def __len__(self):
         return len(self.all_tokenized_sequences)
@@ -217,8 +229,9 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # 创建数据集和数据加载器
-    dataset = MIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=4)
+    # 注意：num_workers 指的是预处理的进程数，不是 DataLoader 的 num_workers
+    dataset = MIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=0) # DataLoader 本身不使用多进程，避免冲突
 
     # 初始化模型
     model = TransformerMusic(vocab_size=VOCAB_SIZE, d_model=512).to(device)
