@@ -11,8 +11,8 @@ import multiprocessing as mp
 
 # --- 配置参数 ---
 ROOT_DIR = r"D:\maestro-v3.0.0\2017"  # 请替换为你的 MIDI 文件夹路径
-MAX_SEQ_LEN = 512  # 模型一次处理的最大 token 长度
-SLIDE_STEP = 256   # 滑动窗口步长（非重叠为 MAX_SEQ_LEN）
+MAX_SEQ_LEN = 128  # 模型一次处理的最大 token 长度
+SLIDE_STEP = 64   # 滑动窗口步长（非重叠为 MAX_SEQ_LEN）
 NUM_WORKERS = 16    # 用于预处理的进程数
 
 # --- 词表和特殊 token ---
@@ -23,14 +23,16 @@ SEP = 3
 
 # --- 字段范围 ---
 PITCH_RANGE = (0, 87)  # 0-87 映射 MIDI 21-108
-MAX_TIME_SHIFT = 1000
-MAX_DURATION = 1000
+# --- 降低时间精度 ---
+MAX_TIME_SHIFT = 100  # 从 1000 降到 100
+MAX_DURATION = 10    # 从 1000 降到 100
 
 # --- 字段偏移 ---
 PITCH_OFFSET = 4
 TIME_SHIFT_OFFSET = PITCH_OFFSET + 88
 DURATION_OFFSET = TIME_SHIFT_OFFSET + MAX_TIME_SHIFT + 1
-VOCAB_SIZE = DURATION_OFFSET + MAX_DURATION + 1
+# --- 新的词表大小：三元组合并 ---
+VOCAB_SIZE = 4 + 88 * (MAX_TIME_SHIFT + 1) * (MAX_DURATION + 1)
 
 # --- MIDI 解析与事件序列化 ---
 def midi_to_events(midi_path, ticks_per_beat_target=480):
@@ -78,26 +80,51 @@ def midi_to_events(midi_path, ticks_per_beat_target=480):
 
     return events
 
-# --- 事件 → token ID (严格顺序：pitch, time_shift, duration) ---
-def event_to_token_ids(pitch, time_shift, duration):
-    """返回一个包含 3 个 token ID 的列表"""
-    ts = min(time_shift, MAX_TIME_SHIFT)
-    dur = min(duration, MAX_DURATION)
-    return [
-        PITCH_OFFSET + pitch,
-        TIME_SHIFT_OFFSET + ts,
-        DURATION_OFFSET + dur
-    ]
+# --- 事件 → 单 token ID (三元组合并) ---
+def event_to_single_token(pitch, time_shift, duration):
+    """将 (pitch, time_shift, duration) 三元组映射为一个唯一的 token ID"""
+    # --- 降低精度：将 time_shift 和 duration 映射到 0-100 ---
+    # 例如，原始 0-1000 tick 映射到 0-100 的桶
+    # 可以使用简单的除法，或者更精细的对数缩放
+    # 这里使用简单的线性缩放
+    max_original_ts = 1000
+    max_original_dur = 1000
+    ts_scaled = min(int(time_shift * MAX_TIME_SHIFT / max_original_ts), MAX_TIME_SHIFT)
+    dur_scaled = min(int(duration * MAX_DURATION / max_original_dur), MAX_DURATION)
+    
+    # 线性组合，确保唯一性
+    # ID = 4 + pitch * (MAX_TIME_SHIFT+1) * (MAX_DURATION+1) + ts_scaled * (MAX_DURATION+1) + dur_scaled
+    token_id = 4 + pitch * (MAX_TIME_SHIFT+1) * (MAX_DURATION+1) + ts_scaled * (MAX_DURATION+1) + dur_scaled
+    return token_id
+
+def single_token_to_event(token_id):
+    """将单 token ID 解析回 (pitch, time_shift, duration) 三元组"""
+    if token_id < 4:
+        return None # 特殊 token
+    token_id -= 4
+    pitch = token_id // ((MAX_TIME_SHIFT+1) * (MAX_DURATION+1))
+    token_id %= (MAX_TIME_SHIFT+1) * (MAX_DURATION+1)
+    time_shift_scaled = token_id // (MAX_DURATION+1)
+    duration_scaled = token_id % (MAX_DURATION+1)
+    
+    # --- 反向缩放回原始时间单位 ---
+    max_original_ts = 1000
+    max_original_dur = 1000
+    # 注意：反向缩放可能有精度损失，但这是为了降低词表大小的权衡
+    time_shift = int(time_shift_scaled * max_original_ts / MAX_TIME_SHIFT)
+    duration = int(duration_scaled * max_original_dur / MAX_DURATION)
+    
+    return pitch, time_shift, duration
 
 # --- 用于多进程的辅助函数 ---
 def process_midi_file(args):
     path, max_seq_len, slide_step = args
     events = midi_to_events(path)
     if events is not None and len(events) > 0:
-        # 将事件序列转换为严格顺序的 token 序列
+        # 将事件序列转换为单一 token 序列
         tokens = [BOS]
         for pitch, ts, dur in events:
-            tokens.extend(event_to_token_ids(pitch, ts, dur)) # [pitch, ts, dur]
+            tokens.append(event_to_single_token(pitch, ts, dur))
         tokens.append(EOS)
         
         # 滑动窗口切分
@@ -146,6 +173,7 @@ class MIDIDataset(Dataset):
                 self.all_tokenized_sequences.extend(result)
         
         print(f"Generated {len(self.all_tokenized_sequences)} training sequences.")
+        print(f"Vocabulary size is: {VOCAB_SIZE} tokens!")
 
     def __len__(self):
         return len(self.all_tokenized_sequences)
@@ -158,6 +186,7 @@ class MIDIDataset(Dataset):
 class MusicTransformerDecoder(nn.Module):
     def __init__(self, vocab_size, d_model=512, nhead=8, num_layers=6, dim_feedforward=2048, dropout=0.1):
         super().__init__()
+        # --- embedding 层大小现在可接受 ---
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoding = self._generate_positional_encoding(d_model, max_len=2048)
         decoder_layer = nn.TransformerDecoderLayer(
@@ -219,7 +248,8 @@ if __name__ == "__main__":
 
     # 创建数据集和数据加载器
     dataset = MIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=0) # DataLoader 本身不使用多进程，避免冲突
+    # --- batch_size 可以适当增加 ---
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=0) # DataLoader 本身不使用多进程，避免冲突
 
     # 初始化模型 (使用修复后的 Decoder-only 模型)
     model = MusicTransformerDecoder(vocab_size=VOCAB_SIZE, d_model=512).to(device)

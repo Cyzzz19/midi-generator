@@ -24,14 +24,15 @@ SEP = 3
 
 # --- 字段范围 ---
 PITCH_RANGE = (0, 87)  # 0-87 映射 MIDI 21-108
-MAX_TIME_SHIFT = 1000
-MAX_DURATION = 1000
+MAX_TIME_SHIFT = 100
+MAX_DURATION = 10
 
 # --- 字段偏移 ---
 PITCH_OFFSET = 4
 TIME_SHIFT_OFFSET = PITCH_OFFSET + 88
 DURATION_OFFSET = TIME_SHIFT_OFFSET + MAX_TIME_SHIFT + 1
-VOCAB_SIZE = DURATION_OFFSET + MAX_DURATION + 1
+# --- 新的词表大小：三元组合并 ---
+VOCAB_SIZE = 4 + 88 * (MAX_TIME_SHIFT + 1) * (MAX_DURATION + 1)
 
 # --- MIDI 解析与事件序列化 (与训练时相同) ---
 def midi_to_events(midi_path, ticks_per_beat_target=480):
@@ -79,50 +80,44 @@ def midi_to_events(midi_path, ticks_per_beat_target=480):
 
     return events
 
-# --- 事件 → token ID (与训练时相同) ---
-def event_to_token_ids(pitch, time_shift, duration):
-    """返回一个包含 3 个 token ID 的列表"""
+# --- 事件 → 单 token ID (三元组合并) (与训练时相同) ---
+def event_to_single_token(pitch, time_shift, duration):
+    """将 (pitch, time_shift, duration) 三元组映射为一个唯一的 token ID"""
     ts = min(time_shift, MAX_TIME_SHIFT)
     dur = min(duration, MAX_DURATION)
-    return [
-        PITCH_OFFSET + pitch,
-        TIME_SHIFT_OFFSET + ts,
-        DURATION_OFFSET + dur
-    ]
+    # 线性组合，确保唯一性
+    token_id = 4 + pitch * (MAX_TIME_SHIFT+1) * (MAX_DURATION+1) + ts * (MAX_DURATION+1) + dur
+    return token_id
 
-# --- Token ID → 事件 (用于生成) ---
-def token_to_event_type_and_value(token_id):
-    """辅助函数，用于调试，确定 token 类型"""
-    if token_id >= DURATION_OFFSET and token_id < DURATION_OFFSET + MAX_DURATION + 1:
-        return 'duration', token_id - DURATION_OFFSET
-    elif token_id >= TIME_SHIFT_OFFSET and token_id < DURATION_OFFSET:
-        return 'time_shift', token_id - TIME_SHIFT_OFFSET
-    elif token_id >= PITCH_OFFSET and token_id < TIME_SHIFT_OFFSET:
-        return 'pitch', token_id - PITCH_OFFSET
-    else:
-        return 'special', token_id
+def single_token_to_event(token_id):
+    """将单 token ID 解析回 (pitch, time_shift, duration) 三元组"""
+    if token_id < 4:
+        return None # 特殊 token
+    token_id -= 4
+    pitch = token_id // ((MAX_TIME_SHIFT+1) * (MAX_DURATION+1))
+    token_id %= (MAX_TIME_SHIFT+1) * (MAX_DURATION+1)
+    time_shift = token_id // (MAX_DURATION+1)
+    duration = token_id % (MAX_DURATION+1)
+    return pitch, time_shift, duration
 
 # --- 采样辅助函数 ---
 def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
     """
     根据 top_k 和 top_p 过滤 logits
+    注意：对于巨大的词表，top_k 和 top_p 可能非常耗时
     """
     top_k = min(top_k, logits.size(-1))  # Safety check
     if top_k > 0:
         # Remove all tokens with a probability less than the last token of the top-k
-        # logits shape: (vocab_size,)
-        # We need to reshape for scatter operations if needed, but topk returns indices for the last dim
-        indices_to_remove = logits < torch.topk(logits, top_k)[0][-1] # [0] are values, [1] are indices
+        indices_to_remove = logits < torch.topk(logits, top_k)[0][-1]
         logits[indices_to_remove] = filter_value
 
     if top_p > 0.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True) # Both shape (vocab_size,)
-        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1) # shape (vocab_size,)
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
 
         # Remove tokens with cumulative probability above the threshold
-        sorted_indices_to_remove = cumulative_probs > top_p # shape (vocab_size,)
-
-        # Shift the indices to the right to keep also the first token above the threshold
+        sorted_indices_to_remove = cumulative_probs > top_p
         sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
         sorted_indices_to_remove[0] = 0
 
@@ -184,6 +179,7 @@ def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=
         
         # 预测下一个 token
         next_token_logits = output[0, -1, :] / temperature
+        # --- 注意：对于巨大词表，top_k/top_p 可能很慢 ---
         filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
         probs = torch.softmax(filtered_logits, dim=-1)
         next_token_id = torch.multinomial(probs, num_samples=1).item()
@@ -200,64 +196,38 @@ def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=
     # 返回完整的生成序列（上下文 + 生成部分）
     return generated[0].cpu().tolist()
 
-# --- 将生成的 tokens 转换为 MIDI 并保存 (严格按三元组解析) ---
+# --- 将生成的 tokens 转换为 MIDI 并保存 ---
 def tokens_to_midi(tokens, output_path, ticks_per_beat=480):
     """
     将 token 序列转换为 MIDI 文件并保存
-    修复：严格按 (pitch, time_shift, duration) 三元组解析
+    修复：使用 single_token_to_event 解析
     """
     pm = pretty_midi.PrettyMIDI(initial_tempo=120, resolution=ticks_per_beat)
     piano_program = pretty_midi.instrument_name_to_program('Acoustic Grand Piano')
     piano = pretty_midi.Instrument(program=piano_program)
 
     current_time = 0.0
-    i = 0
+    for token_id in tokens:
+        if token_id == BOS or token_id == EOS or token_id == PAD or token_id == SEP:
+            continue # 忽略特殊 token
 
-    while i < len(tokens):
-        token_id = tokens[i]
-        
-        # 检查是否为 pitch token
-        if PITCH_OFFSET <= token_id < TIME_SHIFT_OFFSET:
-            # 尝试读取接下来的两个 token 作为 time_shift 和 duration
-            if i + 2 < len(tokens):
-                next1_id = tokens[i + 1]
-                next2_id = tokens[i + 2]
-                
-                # 验证 next1 是否为 time_shift, next2 是否为 duration
-                if (TIME_SHIFT_OFFSET <= next1_id < DURATION_OFFSET and
-                    DURATION_OFFSET <= next2_id < VOCAB_SIZE):
-                    
-                    # 解析三元组
-                    pitch = token_id - PITCH_OFFSET
-                    time_shift = next1_id - TIME_SHIFT_OFFSET
-                    duration = next2_id - DURATION_OFFSET
-                    
-                    # 计算实际时间（秒）
-                    start_time = current_time + time_shift / (2 * ticks_per_beat)
-                    end_time = start_time + duration / (2 * ticks_per_beat)
-                    
-                    # 创建音符
-                    note = pretty_midi.Note(
-                        velocity=64,
-                        pitch=pitch + 21,  # 转回 MIDI 音高
-                        start=start_time,
-                        end=end_time
-                    )
-                    piano.notes.append(note)
-                    current_time = start_time  # 更新当前时间
-                    
-                    i += 3  # 跳过已处理的 3 个 token
-                    continue
-                else:
-                    # 三元组不完整，跳过当前 token
-                    print(f"Warning: Invalid token sequence at index {i}: {token_id}, {next1_id}, {next2_id}")
-                    i += 1
-            else:
-                # 序列结尾，不足以形成三元组，跳过
-                i += 1
-        else:
-            # 不是 pitch token，跳过
-            i += 1
+        event_tuple = single_token_to_event(token_id)
+        if event_tuple is not None:
+            pitch, time_shift, duration = event_tuple
+            # 计算实际时间（秒）
+            start_time = current_time + time_shift / (2 * ticks_per_beat)
+            end_time = start_time + duration / (2 * ticks_per_beat)
+            
+            # 创建音符
+            note = pretty_midi.Note(
+                velocity=64,
+                pitch=pitch + 21,  # 转回 MIDI 音高
+                start=start_time,
+                end=end_time
+            )
+            piano.notes.append(note)
+            current_time = start_time  # 更新当前时间
+        # else: # token_id 是无效的，忽略
 
     pm.instruments.append(piano)
     pm.write(output_path)
@@ -283,7 +253,7 @@ if __name__ == "__main__":
 
     input_tokens = [BOS]
     for pitch, ts, dur in input_events:
-        input_tokens.extend(event_to_token_ids(pitch, ts, dur)) # [pitch, ts, dur]
+        input_tokens.append(event_to_single_token(pitch, ts, dur)) # 单一 token
     # input_tokens.append(EOS) # 不需要在输入末尾添加 EOS
 
     print(f"Input sequence length: {len(input_tokens)} tokens.")
