@@ -153,21 +153,16 @@ class MIDIDataset(Dataset):
         tokens = self.all_tokenized_sequences[idx]
         return torch.tensor(tokens, dtype=torch.long)
 
-# --- 模型定义 ---
-class TransformerMusic(nn.Module):
-    def __init__(self, vocab_size, d_model=512, nhead=8, num_encoder_layers=6,
-                 num_decoder_layers=6, dim_feedforward=2048, dropout=0.1):
+# --- 修复后的模型：仅 Decoder (GPT-style) ---
+class MusicTransformerDecoder(nn.Module):
+    def __init__(self, vocab_size, d_model=512, nhead=8, num_layers=6, dim_feedforward=2048, dropout=0.1):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoding = self._generate_positional_encoding(d_model, max_len=2048)
-        self.transformer = nn.Transformer(
-            d_model=d_model, nhead=nhead,
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            batch_first=True
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True
         )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
         self.fc_out = nn.Linear(d_model, vocab_size)
 
     def _generate_positional_encoding(self, d_model, max_len=5000):
@@ -178,15 +173,9 @@ class TransformerMusic(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe.unsqueeze(0)
 
-    def forward(self, src, tgt, src_mask=None, tgt_mask=None, src_key_padding_mask=None, tgt_key_padding_mask=None):
-        src_emb = self.embedding(src) + self.pos_encoding[:, :src.size(1), :].to(src.device)
-        tgt_emb = self.embedding(tgt) + self.pos_encoding[:, :tgt.size(1), :].to(tgt.device)
-        output = self.transformer(
-            src_emb, tgt_emb,
-            src_mask=src_mask, tgt_mask=tgt_mask,
-            src_key_padding_mask=src_key_padding_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask
-        )
+    def forward(self, x, tgt_mask=None, tgt_key_padding_mask=None):
+        x_emb = self.embedding(x) + self.pos_encoding[:, :x.size(1), :].to(x.device)
+        output = self.transformer_decoder(x_emb, x_emb, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
         return self.fc_out(output)
 
 # --- 训练辅助函数 ---
@@ -203,21 +192,20 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
     total_loss = 0
     for batch in tqdm(dataloader, desc="Training"):
         batch = batch.to(device)
-        # 划分 src 和 tgt
-        src = batch[:, :-1]  # 输入（去掉最后一个 token）
-        tgt = batch[:, 1:]   # 目标（去掉第一个 token）
+        # 划分 x 和 y (输入和目标)
+        x = batch[:, :-1]  # 输入（去掉最后一个 token）
+        y = batch[:, 1:]   # 目标（去掉第一个 token）
 
-        # 生成 masks
-        tgt_mask = generate_square_subsequent_mask(tgt.size(1)).to(device)
-        src_padding_mask = create_padding_mask(src, PAD).to(device)
-        tgt_padding_mask = create_padding_mask(tgt, PAD).to(device)
+        # 生成 causal mask
+        tgt_mask = generate_square_subsequent_mask(x.size(1)).to(device)
+        # 生成 padding mask
+        tgt_padding_mask = create_padding_mask(x, PAD).to(device)
 
         optimizer.zero_grad()
-        output = model(src, tgt, tgt_mask=tgt_mask,
-                       src_key_padding_mask=src_padding_mask,
-                       tgt_key_padding_mask=tgt_padding_mask)
+        # 修复：仅使用 decoder，输入为 x
+        output = model(x, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_padding_mask)
         # 修复：使用 .reshape(...) 替代 .view(...)
-        loss = criterion(output.reshape(-1, output.size(-1)), tgt.reshape(-1))
+        loss = criterion(output.reshape(-1, output.size(-1)), y.reshape(-1))
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
@@ -229,12 +217,11 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # 创建数据集和数据加载器
-    # 注意：num_workers 指的是预处理的进程数，不是 DataLoader 的 num_workers
     dataset = MIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS)
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True, num_workers=0) # DataLoader 本身不使用多进程，避免冲突
 
-    # 初始化模型
-    model = TransformerMusic(vocab_size=VOCAB_SIZE, d_model=512).to(device)
+    # 初始化模型 (使用修复后的 Decoder-only 模型)
+    model = MusicTransformerDecoder(vocab_size=VOCAB_SIZE, d_model=512).to(device)
     criterion = nn.CrossEntropyLoss(ignore_index=PAD)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
