@@ -5,16 +5,20 @@ import pretty_midi
 import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
 # --- 配置参数 ---
-MODEL_PATH = "model_epoch_7.pt"  # 模型文件路径 (训练后生成的文件)
-INPUT_MIDI_PATH = "1.mid"  # 输入 MIDI 文件路径
-OUTPUT_MIDI_PATH = "output.mid"  # 输出 MIDI 文件路径
-MAX_SEQ_LEN = 512  # 模型一次处理的最大 token 长度
-MAX_GENERATE_TOKENS = 512  # 生成多少个 token
+MODEL_PATH = "model_epoch_12.pt"  # 模型文件路径 (训练后生成的文件)
+# 如果想测试生成，可以提供一个输入 MIDI
+INPUT_MIDI_PATH = "1.mid" # "path/to/your/input.mid"  # 设为 None 则从随机 token 开始
+MAX_GENERATE_TOKENS = 1536  # 生成多少个 token (例如 512 个三元组)
 TEMPERATURE = 1.0  # 采样温度，控制随机性
 TOP_K = 0  # Top-k 采样，0 表示不使用
 TOP_P = 0.9  # Nucleus sampling，0 表示不使用
+MAX_TIME_STEPS = 2000  # 图像显示的最大时间步（tick）
+MAX_PITCH = 108      # 图像显示的最大音高（MIDI 108 为最高）
+MIN_PITCH = 21       # 图像显示的最小音高（MIDI 21 为最低 A0）
 
 # --- 词表和特殊 token ---
 PAD = 0
@@ -171,7 +175,7 @@ def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=
 
     for _ in tqdm(range(max_generate_tokens), desc="Generating"):
         # 获取模型当前能看到的输入（限制长度）
-        current_input = generated[:, -MAX_SEQ_LEN:]
+        current_input = generated[:, -512:] # 使用一个固定的上下文长度（例如 512）
         
         # 创建因果掩码
         tgt_mask = torch.nn.Transformer.generate_square_subsequent_mask(current_input.size(1)).to(device)
@@ -200,16 +204,13 @@ def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=
     # 返回完整的生成序列（上下文 + 生成部分）
     return generated[0].cpu().tolist()
 
-# --- 将生成的 tokens 转换为 MIDI 并保存 (严格按三元组解析) ---
-def tokens_to_midi(tokens, output_path, ticks_per_beat=480):
+# --- 将生成的 tokens 转换为 MIDI notes (用于可视化) ---
+def tokens_to_notes(tokens):
     """
-    将 token 序列转换为 MIDI 文件并保存
-    修复：严格按 (pitch, time_shift, duration) 三元组解析
+    将 token 序列转换为 [(start_tick, end_tick, pitch), ...] 列表
+    用于可视化，不保存 MIDI 文件
     """
-    pm = pretty_midi.PrettyMIDI(initial_tempo=120, resolution=ticks_per_beat)
-    piano_program = pretty_midi.instrument_name_to_program('Acoustic Grand Piano')
-    piano = pretty_midi.Instrument(program=piano_program)
-
+    notes = []
     current_time = 0.0
     i = 0
 
@@ -228,23 +229,16 @@ def tokens_to_midi(tokens, output_path, ticks_per_beat=480):
                     DURATION_OFFSET <= next2_id < VOCAB_SIZE):
                     
                     # 解析三元组
-                    pitch = token_id - PITCH_OFFSET
+                    pitch = token_id - PITCH_OFFSET + 21 # 转回 MIDI 音高
                     time_shift = next1_id - TIME_SHIFT_OFFSET
                     duration = next2_id - DURATION_OFFSET
                     
-                    # 计算实际时间（秒）
-                    start_time = current_time + time_shift / (2 * ticks_per_beat)
-                    end_time = start_time + duration / (2 * ticks_per_beat)
+                    # 计算实际时间（tick）
+                    start_tick = current_time + time_shift
+                    end_tick = start_tick + duration
                     
-                    # 创建音符
-                    note = pretty_midi.Note(
-                        velocity=64,
-                        pitch=pitch + 21,  # 转回 MIDI 音高
-                        start=start_time,
-                        end=end_time
-                    )
-                    piano.notes.append(note)
-                    current_time = start_time  # 更新当前时间
+                    notes.append((start_tick, end_tick, pitch))
+                    current_time = start_tick  # 更新当前时间
                     
                     i += 3  # 跳过已处理的 3 个 token
                     continue
@@ -259,12 +253,45 @@ def tokens_to_midi(tokens, output_path, ticks_per_beat=480):
             # 不是 pitch token，跳过
             i += 1
 
-    pm.instruments.append(piano)
-    pm.write(output_path)
-    print(f"Generated MIDI saved to {output_path}")
+    return notes
 
+# --- 可视化钢琴卷帘图 ---
+def plot_piano_roll(notes, output_path="debug_piano_roll.png", max_time_steps=MAX_TIME_STEPS, min_pitch=MIN_PITCH, max_pitch=MAX_PITCH):
+    """
+    绘制钢琴卷帘图
+    """
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    for start_tick, end_tick, pitch in notes:
+        if min_pitch <= pitch <= max_pitch and start_tick < max_time_steps:
+            # 创建一个矩形代表音符
+            rect = patches.Rectangle(
+                (start_tick, pitch - 0.5),  # (x, y) bottom-left corner
+                end_tick - start_tick,      # width
+                1,                          # height
+                linewidth=0, alpha=0.8, facecolor='blue'
+            )
+            ax.add_patch(rect)
 
-# --- 主预测脚本 ---
+    # 设置坐标轴
+    ax.set_xlim(0, max_time_steps)
+    ax.set_ylim(min_pitch - 1, max_pitch + 1)
+    ax.set_xlabel('Time (ticks, 120 BPM)')
+    ax.set_ylabel('MIDI Pitch')
+    ax.set_title('Piano Roll Visualization of Generated MIDI')
+    ax.grid(True, axis='y', linestyle='--', alpha=0.6)
+    
+    # 为了更清晰，可以只标注部分 y 轴刻度
+    y_ticks = range(min_pitch, max_pitch + 1, 12) # 每 12 个音符（一个八度）标注一次
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels([pretty_midi.note_number_to_name(p) for p in y_ticks])
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    print(f"Piano roll saved to {output_path}")
+    plt.show() # 显示图像
+
+# --- 主调试脚本 ---
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -275,21 +302,41 @@ if __name__ == "__main__":
     model.to(device)
     print(f"Model loaded from {MODEL_PATH}")
 
-    # 加载并处理输入 MIDI
-    input_events = midi_to_events(INPUT_MIDI_PATH)
-    if input_events is None:
-        print("Failed to load or parse input MIDI file.")
-        exit()
-
-    input_tokens = [BOS]
-    for pitch, ts, dur in input_events:
-        input_tokens.extend(event_to_token_ids(pitch, ts, dur)) # [pitch, ts, dur]
-    # input_tokens.append(EOS) # 不需要在输入末尾添加 EOS
-
-    print(f"Input sequence length: {len(input_tokens)} tokens.")
+    # 准备上下文
+    if INPUT_MIDI_PATH:
+        input_events = midi_to_events(INPUT_MIDI_PATH)
+        if input_events is None:
+            print("Failed to load or parse input MIDI file.")
+            exit()
+        context_tokens = [BOS]
+        for pitch, ts, dur in input_events:
+            context_tokens.extend(event_to_token_ids(pitch, ts, dur)) # [pitch, ts, dur]
+        print(f"Input sequence length: {len(context_tokens)} tokens.")
+    else:
+        # 从随机 token 开始生成
+        context_tokens = [BOS]
+        print("Starting generation from BOS token.")
 
     # 生成
-    generated_tokens = generate(model, input_tokens, MAX_GENERATE_TOKENS, TEMPERATURE, TOP_K, TOP_P)
+    generated_tokens = generate(model, context_tokens, MAX_GENERATE_TOKENS, TEMPERATURE, TOP_K, TOP_P)
+        # 在 generated_tokens = generate(...) 之后添加
+    print("\n--- Generated Tokens (first 30) ---")
+    for i, token in enumerate(generated_tokens[:30]):
+        token_type, value = token_to_event_type_and_value(token)
+        print(f"Index {i}: TokenID={token}, Type={token_type}, Value={value}")
 
-    # 保存生成的 MIDI
-    tokens_to_midi(generated_tokens, OUTPUT_MIDI_PATH)
+    print(f"\nTotal generated tokens: {len(generated_tokens)}")
+
+    # 将生成的 tokens 转换为 notes
+    notes = tokens_to_notes(generated_tokens)
+    print(f"Generated {len(notes)} notes.")
+
+    # 可视化
+    plot_piano_roll(notes)
+
+    # (可选) 保存 MIDI 文件
+    # if INPUT_MIDI_PATH:
+    #     output_midi_path = f"generated_from_{os.path.basename(INPUT_MIDI_PATH)}"
+    # else:
+    #     output_midi_path = "generated_from_scratch.mid"
+    # tokens_to_midi(generated_tokens, output_midi_path)

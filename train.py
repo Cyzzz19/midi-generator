@@ -10,7 +10,7 @@ from tqdm import tqdm
 import multiprocessing as mp
 
 # --- 配置参数 ---
-ROOT_DIR = "D:\maestro-v3.0.0"  # 请替换为你的 MIDI 文件夹路径
+ROOT_DIR = r"D:\maestro-v3.0.0\2017"  # 请替换为你的 MIDI 文件夹路径
 MAX_SEQ_LEN = 512  # 模型一次处理的最大 token 长度
 SLIDE_STEP = 256   # 滑动窗口步长（非重叠为 MAX_SEQ_LEN）
 NUM_WORKERS = 16    # 用于预处理的进程数
@@ -78,8 +78,9 @@ def midi_to_events(midi_path, ticks_per_beat_target=480):
 
     return events
 
-# --- 事件 → token ID ---
-def event_to_token(pitch, time_shift, duration):
+# --- 事件 → token ID (严格顺序：pitch, time_shift, duration) ---
+def event_to_token_ids(pitch, time_shift, duration):
+    """返回一个包含 3 个 token ID 的列表"""
     ts = min(time_shift, MAX_TIME_SHIFT)
     dur = min(duration, MAX_DURATION)
     return [
@@ -93,10 +94,10 @@ def process_midi_file(args):
     path, max_seq_len, slide_step = args
     events = midi_to_events(path)
     if events is not None and len(events) > 0:
-        # 将事件序列转换为 token 序列
+        # 将事件序列转换为严格顺序的 token 序列
         tokens = [BOS]
         for pitch, ts, dur in events:
-            tokens.extend(event_to_token(pitch, ts, dur))
+            tokens.extend(event_to_token_ids(pitch, ts, dur)) # [pitch, ts, dur]
         tokens.append(EOS)
         
         # 滑动窗口切分
