@@ -7,14 +7,14 @@ from collections import defaultdict
 from tqdm import tqdm
 
 # --- 配置参数 ---
-MODEL_PATH = "model_epoch_7.pt"  # 模型文件路径 (训练后生成的文件)
-INPUT_MIDI_PATH = "1.mid"  # 输入 MIDI 文件路径
+MODEL_PATH = "model_epoch_8.pt"  # 模型文件路径 (训练后生成的文件)
+INPUT_MIDI_PATH = "2.mid"  # 输入 MIDI 文件路径
 OUTPUT_MIDI_PATH = "output.mid"  # 输出 MIDI 文件路径
 MAX_SEQ_LEN = 512  # 模型一次处理的最大 token 长度
 MAX_GENERATE_TOKENS = 512  # 生成多少个 token
-TEMPERATURE = 1.0  # 采样温度，控制随机性
-TOP_K = 0  # Top-k 采样，0 表示不使用
-TOP_P = 0.9  # Nucleus sampling，0 表示不使用
+TEMPERATURE = 1.2  # 采样温度，控制随机性
+TOP_K = 10  # Top-k 采样，0 表示不使用
+TOP_P = 0.95  # Nucleus sampling，0 表示不使用
 
 # --- 词表和特殊 token ---
 PAD = 0
@@ -24,15 +24,16 @@ SEP = 3
 
 # --- 字段范围 ---
 PITCH_RANGE = (0, 87)  # 0-87 映射 MIDI 21-108
-MAX_TIME_SHIFT = 100
-MAX_DURATION = 10
+# --- 指数时间量化 ---
+MAX_TIME_SHIFT_BUCKET = 10  # 桶的数量，time_shift 用 0-10 表示 (2^0 到 2^10)
+MAX_DURATION_BUCKET = 10    # 桶的数量，duration 用 0-10 表示 (2^0 到 2^10)
 
 # --- 字段偏移 ---
 PITCH_OFFSET = 4
 TIME_SHIFT_OFFSET = PITCH_OFFSET + 88
-DURATION_OFFSET = TIME_SHIFT_OFFSET + MAX_TIME_SHIFT + 1
+DURATION_OFFSET = TIME_SHIFT_OFFSET + MAX_TIME_SHIFT_BUCKET + 1
 # --- 新的词表大小：三元组合并 ---
-VOCAB_SIZE = 4 + 88 * (MAX_TIME_SHIFT + 1) * (MAX_DURATION + 1)
+VOCAB_SIZE = 4 + 88 * (MAX_TIME_SHIFT_BUCKET + 1) * (MAX_DURATION_BUCKET + 1)
 
 # --- MIDI 解析与事件序列化 (与训练时相同) ---
 def midi_to_events(midi_path, ticks_per_beat_target=480):
@@ -81,12 +82,24 @@ def midi_to_events(midi_path, ticks_per_beat_target=480):
     return events
 
 # --- 事件 → 单 token ID (三元组合并) (与训练时相同) ---
+def quantize_time_to_bucket(time_value, max_bucket):
+    """将时间值转换为桶索引，使用指数映射"""
+    if time_value == 0:
+        return 0
+    bucket = min(max_bucket, int(np.log2(time_value)))
+    return bucket
+
+def dequantize_bucket_to_time(bucket_idx):
+    """将桶索引转换回时间值，使用指数映射"""
+    return 2 ** bucket_idx
+
 def event_to_single_token(pitch, time_shift, duration):
     """将 (pitch, time_shift, duration) 三元组映射为一个唯一的 token ID"""
-    ts = min(time_shift, MAX_TIME_SHIFT)
-    dur = min(duration, MAX_DURATION)
-    # 线性组合，确保唯一性
-    token_id = 4 + pitch * (MAX_TIME_SHIFT+1) * (MAX_DURATION+1) + ts * (MAX_DURATION+1) + dur
+    # --- 指数量化 ---
+    ts_bucket = quantize_time_to_bucket(time_shift, MAX_TIME_SHIFT_BUCKET)
+    dur_bucket = quantize_time_to_bucket(duration, MAX_DURATION_BUCKET)
+    
+    token_id = 4 + pitch * (MAX_TIME_SHIFT_BUCKET+1) * (MAX_DURATION_BUCKET+1) + ts_bucket * (MAX_DURATION_BUCKET+1) + dur_bucket
     return token_id
 
 def single_token_to_event(token_id):
@@ -94,17 +107,21 @@ def single_token_to_event(token_id):
     if token_id < 4:
         return None # 特殊 token
     token_id -= 4
-    pitch = token_id // ((MAX_TIME_SHIFT+1) * (MAX_DURATION+1))
-    token_id %= (MAX_TIME_SHIFT+1) * (MAX_DURATION+1)
-    time_shift = token_id // (MAX_DURATION+1)
-    duration = token_id % (MAX_DURATION+1)
+    pitch = token_id // ((MAX_TIME_SHIFT_BUCKET+1) * (MAX_DURATION_BUCKET+1))
+    token_id %= (MAX_TIME_SHIFT_BUCKET+1) * (MAX_DURATION_BUCKET+1)
+    time_shift_bucket = token_id // (MAX_DURATION_BUCKET+1)
+    duration_bucket = token_id % (MAX_DURATION_BUCKET+1)
+    
+    # --- 反向指数量化 ---
+    time_shift = dequantize_bucket_to_time(time_shift_bucket)
+    duration = dequantize_bucket_to_time(duration_bucket)
+    
     return pitch, time_shift, duration
 
 # --- 采样辅助函数 ---
 def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
     """
     根据 top_k 和 top_p 过滤 logits
-    注意：对于巨大的词表，top_k 和 top_p 可能非常耗时
     """
     top_k = min(top_k, logits.size(-1))  # Safety check
     if top_k > 0:
@@ -153,7 +170,7 @@ class MusicTransformerDecoder(nn.Module):
         return self.fc_out(output)
 
 # --- 修复后的生成函数 ---
-def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=0, top_p=0.0):
+def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=0, top_p=0.9):
     """
     根据上下文 tokens 生成新的 tokens
     修复：使用 Decoder-only 模型进行自回归生成

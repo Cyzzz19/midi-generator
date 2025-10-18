@@ -10,9 +10,9 @@ from tqdm import tqdm
 import multiprocessing as mp
 
 # --- 配置参数 ---
-ROOT_DIR = r"D:\maestro-v3.0.0\2017"  # 请替换为你的 MIDI 文件夹路径
-MAX_SEQ_LEN = 128  # 模型一次处理的最大 token 长度
-SLIDE_STEP = 64   # 滑动窗口步长（非重叠为 MAX_SEQ_LEN）
+ROOT_DIR = r"D:\maestro-v3.0.0"  # 请替换为你的 MIDI 文件夹路径
+MAX_SEQ_LEN = 512  # 模型一次处理的最大 token 长度
+SLIDE_STEP = 256   # 滑动窗口步长（非重叠为 MAX_SEQ_LEN）
 NUM_WORKERS = 16    # 用于预处理的进程数
 
 # --- 词表和特殊 token ---
@@ -23,16 +23,16 @@ SEP = 3
 
 # --- 字段范围 ---
 PITCH_RANGE = (0, 87)  # 0-87 映射 MIDI 21-108
-# --- 降低时间精度 ---
-MAX_TIME_SHIFT = 100  # 从 1000 降到 100
-MAX_DURATION = 10    # 从 1000 降到 100
+# --- 指数时间量化 ---
+MAX_TIME_SHIFT_BUCKET = 10  # 桶的数量，time_shift 用 0-10 表示 (2^0 到 2^10)
+MAX_DURATION_BUCKET = 10    # 桶的数量，duration 用 0-10 表示 (2^0 到 2^10)
 
 # --- 字段偏移 ---
 PITCH_OFFSET = 4
 TIME_SHIFT_OFFSET = PITCH_OFFSET + 88
-DURATION_OFFSET = TIME_SHIFT_OFFSET + MAX_TIME_SHIFT + 1
+DURATION_OFFSET = TIME_SHIFT_OFFSET + MAX_TIME_SHIFT_BUCKET + 1
 # --- 新的词表大小：三元组合并 ---
-VOCAB_SIZE = 4 + 88 * (MAX_TIME_SHIFT + 1) * (MAX_DURATION + 1)
+VOCAB_SIZE = 4 + 88 * (MAX_TIME_SHIFT_BUCKET + 1) * (MAX_DURATION_BUCKET + 1)
 
 # --- MIDI 解析与事件序列化 ---
 def midi_to_events(midi_path, ticks_per_beat_target=480):
@@ -81,20 +81,30 @@ def midi_to_events(midi_path, ticks_per_beat_target=480):
     return events
 
 # --- 事件 → 单 token ID (三元组合并) ---
+def quantize_time_to_bucket(time_value, max_bucket):
+    """将时间值转换为桶索引，使用指数映射"""
+    # 例如，time_value = 1000, max_bucket = 10
+    # 找到最大的 i 使得 2^i <= time_value
+    # 限制在 [0, max_bucket]
+    if time_value == 0:
+        return 0
+    bucket = min(max_bucket, int(np.log2(time_value)))
+    return bucket
+
+def dequantize_bucket_to_time(bucket_idx):
+    """将桶索引转换回时间值，使用指数映射"""
+    # 例如，bucket_idx = 5 -> 2^5 = 32
+    return 2 ** bucket_idx
+
 def event_to_single_token(pitch, time_shift, duration):
     """将 (pitch, time_shift, duration) 三元组映射为一个唯一的 token ID"""
-    # --- 降低精度：将 time_shift 和 duration 映射到 0-100 ---
-    # 例如，原始 0-1000 tick 映射到 0-100 的桶
-    # 可以使用简单的除法，或者更精细的对数缩放
-    # 这里使用简单的线性缩放
-    max_original_ts = 1000
-    max_original_dur = 1000
-    ts_scaled = min(int(time_shift * MAX_TIME_SHIFT / max_original_ts), MAX_TIME_SHIFT)
-    dur_scaled = min(int(duration * MAX_DURATION / max_original_dur), MAX_DURATION)
+    # --- 指数量化 ---
+    ts_bucket = quantize_time_to_bucket(time_shift, MAX_TIME_SHIFT_BUCKET)
+    dur_bucket = quantize_time_to_bucket(duration, MAX_DURATION_BUCKET)
     
     # 线性组合，确保唯一性
-    # ID = 4 + pitch * (MAX_TIME_SHIFT+1) * (MAX_DURATION+1) + ts_scaled * (MAX_DURATION+1) + dur_scaled
-    token_id = 4 + pitch * (MAX_TIME_SHIFT+1) * (MAX_DURATION+1) + ts_scaled * (MAX_DURATION+1) + dur_scaled
+    # ID = 4 + pitch * (MAX_TIME_SHIFT_BUCKET+1) * (MAX_DURATION_BUCKET+1) + ts_bucket * (MAX_DURATION_BUCKET+1) + dur_bucket
+    token_id = 4 + pitch * (MAX_TIME_SHIFT_BUCKET+1) * (MAX_DURATION_BUCKET+1) + ts_bucket * (MAX_DURATION_BUCKET+1) + dur_bucket
     return token_id
 
 def single_token_to_event(token_id):
@@ -102,17 +112,14 @@ def single_token_to_event(token_id):
     if token_id < 4:
         return None # 特殊 token
     token_id -= 4
-    pitch = token_id // ((MAX_TIME_SHIFT+1) * (MAX_DURATION+1))
-    token_id %= (MAX_TIME_SHIFT+1) * (MAX_DURATION+1)
-    time_shift_scaled = token_id // (MAX_DURATION+1)
-    duration_scaled = token_id % (MAX_DURATION+1)
+    pitch = token_id // ((MAX_TIME_SHIFT_BUCKET+1) * (MAX_DURATION_BUCKET+1))
+    token_id %= (MAX_TIME_SHIFT_BUCKET+1) * (MAX_DURATION_BUCKET+1)
+    time_shift_bucket = token_id // (MAX_DURATION_BUCKET+1)
+    duration_bucket = token_id % (MAX_DURATION_BUCKET+1)
     
-    # --- 反向缩放回原始时间单位 ---
-    max_original_ts = 1000
-    max_original_dur = 1000
-    # 注意：反向缩放可能有精度损失，但这是为了降低词表大小的权衡
-    time_shift = int(time_shift_scaled * max_original_ts / MAX_TIME_SHIFT)
-    duration = int(duration_scaled * max_original_dur / MAX_DURATION)
+    # --- 反向指数量化 ---
+    time_shift = dequantize_bucket_to_time(time_shift_bucket)
+    duration = dequantize_bucket_to_time(duration_bucket)
     
     return pitch, time_shift, duration
 
@@ -148,7 +155,7 @@ def process_midi_file(args):
 
 # --- 数据集类 ---
 class MIDIDataset(Dataset):
-    def __init__(self, root_dir, max_seq_len, slide_step, num_workers):
+    def __init__(self, root_dir, max_seq_len, slide_step, num_workers, split='train'):
         self.max_seq_len = max_seq_len
         
         # 递归搜索所有 .mid 文件
@@ -157,6 +164,15 @@ class MIDIDataset(Dataset):
             file_paths.extend(glob.glob(os.path.join(root_dir, '**', ext), recursive=True))
         print(f"Found {len(file_paths)} MIDI files.")
         
+        # --- 划分训练集和验证集 ---
+        np.random.seed(42)
+        np.random.shuffle(file_paths)
+        split_idx = int(0.9 * len(file_paths))
+        if split == 'train':
+            file_paths = file_paths[:split_idx]
+        else: # 'val'
+            file_paths = file_paths[split_idx:]
+
         # 准备多进程参数
         args_list = [(path, max_seq_len, slide_step) for path in file_paths]
         
@@ -174,6 +190,7 @@ class MIDIDataset(Dataset):
         
         print(f"Generated {len(self.all_tokenized_sequences)} training sequences.")
         print(f"Vocabulary size is: {VOCAB_SIZE} tokens!")
+        print(f"Time quantization: 2^0 to 2^{MAX_TIME_SHIFT_BUCKET} (for time_shift), 2^0 to 2^{MAX_DURATION_BUCKET} (for duration)")
 
     def __len__(self):
         return len(self.all_tokenized_sequences)
@@ -220,11 +237,32 @@ def create_padding_mask(seq, pad_token=PAD):
 def train_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0
-    for batch in tqdm(dataloader, desc="Training"):
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training")):
         batch = batch.to(device)
-        # 划分 x 和 y (输入和目标)
-        x = batch[:, :-1]  # 输入（去掉最后一个 token）
-        y = batch[:, 1:]   # 目标（去掉第一个 token）
+        x = batch[:, :-1]  # 输入
+        y = batch[:, 1:]   # 目标
+
+        # --- 调试：打印第一个 batch 的样本 ---
+        if batch_idx == 0:
+            print("\n--- DEBUG: Training Sample ---")
+            print("Input (x) first sequence (first 10 tokens):")
+            for i, token in enumerate(x[0][:10].cpu().tolist()):
+                event = single_token_to_event(token)
+                if event:
+                    pitch, ts, dur = event
+                    print(f"  x[{i}]: Pitch={pitch+21}, TS={ts}, Dur={dur} (TokenID={token})")
+                else:
+                    print(f"  x[{i}]: Special Token ({token})")
+            
+            print("Target (y) first sequence (first 10 tokens):")
+            for i, token in enumerate(y[0][:10].cpu().tolist()):
+                event = single_token_to_event(token)
+                if event:
+                    pitch, ts, dur = event
+                    print(f"  y[{i}]: Pitch={pitch+21}, TS={ts}, Dur={dur} (TokenID={token})")
+                else:
+                    print(f"  y[{i}]: Special Token ({token})")
+            print("--- End DEBUG ---\n")
 
         # 生成 causal mask
         tgt_mask = generate_square_subsequent_mask(x.size(1)).to(device)
