@@ -14,6 +14,7 @@ ROOT_DIR = r"D:\maestro-v3.0.0"  # 请替换为你的 MIDI 文件夹路径
 MAX_SEQ_LEN = 512  # 模型一次处理的最大 token 长度
 SLIDE_STEP = 256   # 滑动窗口步长（非重叠为 MAX_SEQ_LEN）
 NUM_WORKERS = 16    # 用于预处理的进程数
+VALIDATION_SPLIT = 0.1  # 10% 作为验证集
 
 # --- 词表和特殊 token ---
 PAD = 0
@@ -165,13 +166,15 @@ class MIDIDataset(Dataset):
         print(f"Found {len(file_paths)} MIDI files.")
         
         # --- 划分训练集和验证集 ---
-        np.random.seed(42)
+        np.random.seed(42)  # 为了复现性
         np.random.shuffle(file_paths)
-        split_idx = int(0.9 * len(file_paths))
+        split_idx = int((1 - VALIDATION_SPLIT) * len(file_paths))
         if split == 'train':
             file_paths = file_paths[:split_idx]
         else: # 'val'
             file_paths = file_paths[split_idx:]
+        
+        print(f"Using {len(file_paths)} files for {split} set.")
 
         # 准备多进程参数
         args_list = [(path, max_seq_len, slide_step) for path in file_paths]
@@ -180,7 +183,7 @@ class MIDIDataset(Dataset):
         print(f"Preprocessing MIDI files using {num_workers} processes...")
         with mp.Pool(processes=num_workers) as pool:
             # imap_unordered 可以在任务完成时立即获取结果，可能更快
-            results = list(tqdm(pool.imap_unordered(process_midi_file, args_list), total=len(args_list), desc="Processing MIDI files"))
+            results = list(tqdm(pool.imap_unordered(process_midi_file, args_list), total=len(args_list), desc=f"Processing {split} MIDI files"))
         
         # 合并所有结果
         self.all_tokenized_sequences = []
@@ -188,7 +191,7 @@ class MIDIDataset(Dataset):
             if result: # 检查是否有返回的序列
                 self.all_tokenized_sequences.extend(result)
         
-        print(f"Generated {len(self.all_tokenized_sequences)} training sequences.")
+        print(f"Generated {len(self.all_tokenized_sequences)} {split} sequences.")
         print(f"Vocabulary size is: {VOCAB_SIZE} tokens!")
         print(f"Time quantization: 2^0 to 2^{MAX_TIME_SHIFT_BUCKET} (for time_shift), 2^0 to 2^{MAX_DURATION_BUCKET} (for duration)")
 
@@ -239,30 +242,9 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
     total_loss = 0
     for batch_idx, batch in enumerate(tqdm(dataloader, desc="Training")):
         batch = batch.to(device)
-        x = batch[:, :-1]  # 输入
-        y = batch[:, 1:]   # 目标
-
-        # --- 调试：打印第一个 batch 的样本 ---
-        if batch_idx == 0:
-            print("\n--- DEBUG: Training Sample ---")
-            print("Input (x) first sequence (first 10 tokens):")
-            for i, token in enumerate(x[0][:10].cpu().tolist()):
-                event = single_token_to_event(token)
-                if event:
-                    pitch, ts, dur = event
-                    print(f"  x[{i}]: Pitch={pitch+21}, TS={ts}, Dur={dur} (TokenID={token})")
-                else:
-                    print(f"  x[{i}]: Special Token ({token})")
-            
-            print("Target (y) first sequence (first 10 tokens):")
-            for i, token in enumerate(y[0][:10].cpu().tolist()):
-                event = single_token_to_event(token)
-                if event:
-                    pitch, ts, dur = event
-                    print(f"  y[{i}]: Pitch={pitch+21}, TS={ts}, Dur={dur} (TokenID={token})")
-                else:
-                    print(f"  y[{i}]: Special Token ({token})")
-            print("--- End DEBUG ---\n")
+        # 划分 x 和 y (输入和目标)
+        x = batch[:, :-1]  # 输入（去掉最后一个 token）
+        y = batch[:, 1:]   # 目标（去掉第一个 token）
 
         # 生成 causal mask
         tgt_mask = generate_square_subsequent_mask(x.size(1)).to(device)
@@ -277,6 +259,47 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
+
+        # --- 调试：打印第一个 batch 的样本 ---
+        # if batch_idx == 0:
+        #     print("\n--- DEBUG: Training Sample ---")
+        #     print("Input (x) first sequence (first 10 tokens):")
+        #     for i, token in enumerate(x[0][:10].cpu().tolist()):
+        #         event = single_token_to_event(token)
+        #         if event:
+        #             pitch, ts, dur = event
+        #             print(f"  x[{i}]: Pitch={pitch+21}, TS={ts}, Dur={dur} (TokenID={token})")
+        #         else:
+        #             print(f"  x[{i}]: Special Token ({token})")
+        #     
+        #     print("Target (y) first sequence (first 10 tokens):")
+        #     for i, token in enumerate(y[0][:10].cpu().tolist()):
+        #         event = single_token_to_event(token)
+        #         if event:
+        #             pitch, ts, dur = event
+        #             print(f"  y[{i}]: Pitch={pitch+21}, TS={ts}, Dur={dur} (TokenID={token})")
+        #         else:
+        #             print(f"  y[{i}]: Special Token ({token})")
+        #     print("--- End DEBUG ---\n")
+
+    return total_loss / len(dataloader)
+
+def evaluate_epoch(model, dataloader, criterion, device):
+    """计算验证集 loss"""
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Evaluating"):
+            batch = batch.to(device)
+            x = batch[:, :-1]
+            y = batch[:, 1:]
+
+            tgt_mask = generate_square_subsequent_mask(x.size(1)).to(device)
+            tgt_padding_mask = create_padding_mask(x, PAD).to(device)
+
+            output = model(x, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_padding_mask)
+            loss = criterion(output.reshape(-1, output.size(-1)), y.reshape(-1))
+            total_loss += loss.item()
     return total_loss / len(dataloader)
 
 # --- 主训练脚本 ---
@@ -285,9 +308,11 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # 创建数据集和数据加载器
-    dataset = MIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS)
-    # --- batch_size 可以适当增加 ---
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=0) # DataLoader 本身不使用多进程，避免冲突
+    train_dataset = MIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS, split='train')
+    val_dataset = MIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS, split='val')
+    
+    train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
+    val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
 
     # 初始化模型 (使用修复后的 Decoder-only 模型)
     model = MusicTransformerDecoder(vocab_size=VOCAB_SIZE, d_model=512).to(device)
@@ -298,8 +323,9 @@ if __name__ == "__main__":
     num_epochs = 50
     for epoch in range(num_epochs):
         print(f"\n--- Epoch {epoch+1}/{num_epochs} ---")
-        loss = train_epoch(model, dataloader, optimizer, criterion, device)
-        print(f"Epoch {epoch+1}, Average Loss: {loss:.4f}")
+        train_loss = train_epoch(model, train_dataloader, optimizer, criterion, device)
+        val_loss = evaluate_epoch(model, val_dataloader, criterion, device)
+        print(f"Epoch {epoch+1}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         # 保存模型检查点
         torch.save(model.state_dict(), f"model_epoch_{epoch+1}.pt")
 
