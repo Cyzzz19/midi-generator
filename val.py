@@ -7,14 +7,18 @@ from collections import defaultdict
 from tqdm import tqdm
 
 # --- 配置参数 ---
-MODEL_PATH = "model_epoch_8.pt"  # 模型文件路径 (训练后生成的文件)
+MODEL_PATH = "model_epoch_7.pt"  # 模型文件路径 (训练后生成的文件)
 INPUT_MIDI_PATH = "2.mid"  # 输入 MIDI 文件路径
 OUTPUT_MIDI_PATH = "output.mid"  # 输出 MIDI 文件路径
 MAX_SEQ_LEN = 512  # 模型一次处理的最大 token 长度
 MAX_GENERATE_TOKENS = 512  # 生成多少个 token
-TEMPERATURE = 1.2  # 采样温度，控制随机性
-TOP_K = 10  # Top-k 采样，0 表示不使用
-TOP_P = 0.95  # Nucleus sampling，0 表示不使用
+# --- 增加随机性 ---
+TEMPERATURE = 1.5  # 从 1.0 提高到 1.5
+TOP_K = 20         # 限制候选 token 的数量
+TOP_P = 0.95       # 保持 nucleus sampling
+# --- 重复惩罚 ---
+REPETITION_PENALTY = 2.0  # 重复 token 的惩罚系数
+REPETITION_PENALTY_WINDOW = 10  # 检查最后 N 个 token
 
 # --- 词表和特殊 token ---
 PAD = 0
@@ -144,9 +148,27 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
         logits[indices_to_remove] = filter_value
     return logits
 
+# --- 重复惩罚函数 ---
+def apply_repetition_penalty(logits, generated_tokens, penalty, window_size):
+    """
+    对最近生成的 tokens 应用惩罚
+    """
+    if len(generated_tokens) < 2:
+        return logits
+    
+    # 取最近的 window_size 个 token
+    recent_tokens = generated_tokens[-window_size:]
+    
+    # 对这些 token 的 logits 施加惩罚
+    for token_id in recent_tokens:
+        if token_id < logits.size(-1): # 确保 token_id 在范围内
+            logits[token_id] = logits[token_id] / penalty
+    
+    return logits
+
 # --- 修复后的模型：仅 Decoder (GPT-style) ---
 class MusicTransformerDecoder(nn.Module):
-    def __init__(self, vocab_size, d_model=512, nhead=8, num_layers=6, dim_feedforward=2048, dropout=0.1):
+    def __init__(self, vocab_size, d_model=1024, nhead=8, num_layers=12, dim_feedforward=4096, dropout=0.3):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.pos_encoding = self._generate_positional_encoding(d_model, max_len=2048)
@@ -170,10 +192,11 @@ class MusicTransformerDecoder(nn.Module):
         return self.fc_out(output)
 
 # --- 修复后的生成函数 ---
-def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=0, top_p=0.9):
+def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=0, top_p=0.0, repetition_penalty=1.0, repetition_penalty_window=3):
     """
     根据上下文 tokens 生成新的 tokens
     修复：使用 Decoder-only 模型进行自回归生成
+    修复：增加重复惩罚
     """
     model.eval()
     device = next(model.parameters()).device
@@ -181,7 +204,7 @@ def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=
     # 初始化生成序列：从上下文开始
     generated = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(0) # (1, L)
 
-    for _ in tqdm(range(max_generate_tokens), desc="Generating"):
+    for i in tqdm(range(max_generate_tokens), desc="Generating"):
         # 获取模型当前能看到的输入（限制长度）
         current_input = generated[:, -MAX_SEQ_LEN:]
         
@@ -196,6 +219,16 @@ def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=
         
         # 预测下一个 token
         next_token_logits = output[0, -1, :] / temperature
+        
+        # --- 应用重复惩罚 ---
+        if repetition_penalty != 1.0:
+            next_token_logits = apply_repetition_penalty(
+                next_token_logits, 
+                generated[0].tolist(), 
+                repetition_penalty, 
+                repetition_penalty_window
+            )
+        
         # --- 注意：对于巨大词表，top_k/top_p 可能很慢 ---
         filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
         probs = torch.softmax(filtered_logits, dim=-1)
@@ -276,7 +309,16 @@ if __name__ == "__main__":
     print(f"Input sequence length: {len(input_tokens)} tokens.")
 
     # 生成
-    generated_tokens = generate(model, input_tokens, MAX_GENERATE_TOKENS, TEMPERATURE, TOP_K, TOP_P)
+    generated_tokens = generate(
+        model, 
+        input_tokens, 
+        MAX_GENERATE_TOKENS, 
+        TEMPERATURE, 
+        TOP_K, 
+        TOP_P,
+        REPETITION_PENALTY,
+        REPETITION_PENALTY_WINDOW
+    )
 
     # 保存生成的 MIDI
     tokens_to_midi(generated_tokens, OUTPUT_MIDI_PATH)

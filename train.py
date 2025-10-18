@@ -204,7 +204,7 @@ class MIDIDataset(Dataset):
 
 # --- 修复后的模型：仅 Decoder (GPT-style) ---
 class MusicTransformerDecoder(nn.Module):
-    def __init__(self, vocab_size, d_model=512, nhead=8, num_layers=6, dim_feedforward=2048, dropout=0.1):
+    def __init__(self, vocab_size, d_model=1024, nhead=8, num_layers=12, dim_feedforward=4096, dropout=0.3):
         super().__init__()
         # --- embedding 层大小现在可接受 ---
         self.embedding = nn.Embedding(vocab_size, d_model)
