@@ -7,17 +7,19 @@ from tqdm import tqdm
 
 # --- 配置参数 ---
 MODEL_PATH = "best_harmony_model.pt"
-INPUT_MIDI_PATH = "1.mid"
-OUTPUT_MIDI_PATH = "output.mid"
+INPUT_MELODY_PATH = "2.mid"          # 输入旋律 MIDI
+OUTPUT_ACCOMPANIMENT_PATH = "accompaniment.mid"  # 仅伴奏
+OUTPUT_FULL_PATH = "full_harmony.mid"     # 旋律 + 伴奏
+
 MAX_SEQ_LEN = 2048
 MAX_GENERATE_TOKENS = 2048
 
 # --- 采样参数 ---
-TEMPERATURE = 1.5
-TOP_K = 20
-TOP_P = 0.95
-REPETITION_PENALTY = 2.0
-REPETITION_PENALTY_WINDOW = 30
+TEMPERATURE = 1.2
+TOP_K = 25
+TOP_P = 0.92
+REPETITION_PENALTY = 1.8
+REPETITION_PENALTY_WINDOW = 40
 
 # --- 词表和特殊 token ---
 PAD = 0
@@ -25,14 +27,9 @@ BOS = 1
 EOS = 2
 SEP = 3
 
-# --- 字段范围与量化 ---
-PITCH_RANGE = (0, 87)
+# --- 字段范围 ---
 MAX_TIME_SHIFT_BUCKET = 10
 MAX_DURATION_BUCKET = 10
-
-PITCH_OFFSET = 4
-TIME_SHIFT_OFFSET = PITCH_OFFSET + 88
-DURATION_OFFSET = TIME_SHIFT_OFFSET + MAX_TIME_SHIFT_BUCKET + 1
 VOCAB_SIZE = 4 + 88 * (MAX_TIME_SHIFT_BUCKET + 1) * (MAX_DURATION_BUCKET + 1)
 
 # --- 与训练完全一致的量化函数 ---
@@ -58,18 +55,14 @@ def single_token_to_event(token_id):
     token_id %= (MAX_TIME_SHIFT_BUCKET + 1) * (MAX_DURATION_BUCKET + 1)
     ts_bucket = token_id // (MAX_DURATION_BUCKET + 1)
     dur_bucket = token_id % (MAX_DURATION_BUCKET + 1)
-    time_shift = dequantize_bucket_to_time(ts_bucket)
-    duration = dequantize_bucket_to_time(dur_bucket)
-    return pitch, time_shift, duration
+    return pitch, dequantize_bucket_to_time(ts_bucket), dequantize_bucket_to_time(dur_bucket)
 
-# --- MIDI 解析（与训练一致）---
-def midi_to_events(midi_path, ticks_per_beat_target=480):
+# --- MIDI 解析（仅旋律）---
+def midi_to_melody_events(midi_path):
     try:
         midi = pretty_midi.PrettyMIDI(midi_path)
-    except Exception:
-        return None
-
-    if len(midi.instruments) == 0:
+    except Exception as e:
+        print(f"Error loading MIDI: {e}")
         return None
 
     notes = []
@@ -78,12 +71,15 @@ def midi_to_events(midi_path, ticks_per_beat_target=480):
     if not notes:
         return None
 
+    # 保留钢琴范围
+    notes = [n for n in notes if 21 <= n.pitch <= 108]
+    if not notes:
+        return None
+
     notes.sort(key=lambda x: x.start)
     events = []
     last_tick = 0
     for note in notes:
-        if note.pitch < 21 or note.pitch > 108:
-            continue
         start_120 = int(note.start * 2 * 480)
         end_120 = int(note.end * 2 * 480)
         duration = max(1, end_120 - start_120)
@@ -93,7 +89,7 @@ def midi_to_events(midi_path, ticks_per_beat_target=480):
         last_tick = start_120
     return events
 
-# --- 采样辅助函数 ---
+# --- 采样函数 ---
 def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
     assert logits.dim() == 1
     top_k = min(top_k, logits.size(-1))
@@ -115,13 +111,13 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
 def apply_repetition_penalty(logits, generated_tokens, penalty, window_size):
     if len(generated_tokens) == 0:
         return logits
-    recent_tokens = generated_tokens[-window_size:]
-    for token_id in set(recent_tokens):  # 去重，避免重复惩罚
+    recent_tokens = list(set(generated_tokens[-window_size:]))  # 去重
+    for token_id in recent_tokens:
         if 0 <= token_id < logits.size(0):
             logits[token_id] /= penalty
     return logits
 
-# --- 与训练完全一致的模型定义 ---
+# --- 模型定义（与训练完全一致）---
 class MusicTransformerDecoder(nn.Module):
     def __init__(self, vocab_size, d_model=256, nhead=8, num_layers=6, dim_feedforward=1024, dropout=0.3):
         super().__init__()
@@ -147,29 +143,40 @@ class MusicTransformerDecoder(nn.Module):
         output = self.transformer_decoder(x_emb, x_emb, tgt_mask=tgt_mask, tgt_key_padding_mask=tgt_key_padding_mask)
         return self.fc_out(output)
 
-# --- 自定义因果掩码（避免 PyTorch 版本问题）---
+# --- 因果掩码 ---
 def generate_square_subsequent_mask(sz):
     mask = torch.triu(torch.ones(sz, sz), diagonal=1)
     return mask.masked_fill(mask == 1, float('-inf'))
 
 # --- 生成函数 ---
-def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=0, top_p=0.0,
-             repetition_penalty=1.0, repetition_penalty_window=30):
+def generate_accompaniment(model, melody_tokens, max_generate_tokens, temperature=1.0,
+                          top_k=0, top_p=0.0, repetition_penalty=1.0, repetition_penalty_window=30):
     model.eval()
     device = next(model.parameters()).device
-    generated = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(0)
 
-    for _ in tqdm(range(max_generate_tokens), desc="Generating"):
-        current_input = generated[:, -MAX_SEQ_LEN:]
-        seq_len = current_input.size(1)
+    # 输入：旋律序列（带 BOS/EOS）
+    input_seq = torch.tensor(melody_tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+    # 生成目标序列（从 BOS 开始）
+    generated = torch.tensor([BOS], dtype=torch.long, device=device).unsqueeze(0)
+
+    for _ in tqdm(range(max_generate_tokens), desc="Generating Accompaniment"):
+        # 当前输入：旋律（固定） + 已生成伴奏（滑动窗口）
+        current_input = input_seq[:, -MAX_SEQ_LEN:]
+        current_target = generated[:, -MAX_SEQ_LEN:]
+
+        # 注意：模型只接收 target 作为输入！
+        # 因为训练时是：input=旋律, target=伴奏 → 模型学习 P(伴奏 | 旋律)
+        # 但在推理时，我们需要自回归生成伴奏，所以输入应为已生成的伴奏
+        x = current_target
+        seq_len = x.size(1)
         tgt_mask = generate_square_subsequent_mask(seq_len).to(device)
-        padding_mask = (current_input == PAD).to(device)
+        padding_mask = (x == PAD).to(device)
 
         with torch.no_grad():
-            output = model(current_input, tgt_mask=tgt_mask, tgt_key_padding_mask=padding_mask)
+            output = model(x, tgt_mask=tgt_mask, tgt_key_padding_mask=padding_mask)
             next_token_logits = output[0, -1, :] / temperature
 
-        # 应用重复惩罚
         if repetition_penalty != 1.0:
             next_token_logits = apply_repetition_penalty(
                 next_token_logits,
@@ -183,7 +190,7 @@ def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=
         next_token_id = torch.multinomial(probs, num_samples=1).item()
 
         if next_token_id == EOS:
-            print("EOS token generated, stopping.")
+            print("EOS generated. Stopping.")
             break
 
         next_token_tensor = torch.tensor([[next_token_id]], device=device)
@@ -191,11 +198,10 @@ def generate(model, context_tokens, max_generate_tokens, temperature=1.0, top_k=
 
     return generated[0].cpu().tolist()
 
-# --- Token 转 MIDI（严格对齐训练时的时间逻辑）---
-def tokens_to_midi(tokens, output_path, ticks_per_beat=480):
-    pm = pretty_midi.PrettyMIDI(initial_tempo=120, resolution=ticks_per_beat)
-    piano = pretty_midi.Instrument(program=0)  # Acoustic Grand Piano
-
+# --- Token 转 MIDI ---
+def tokens_to_notes(tokens):
+    """将 token 序列转为 (pitch, start_tick, end_tick) 列表"""
+    notes = []
     current_tick = 0
     for token_id in tokens:
         if token_id in (BOS, EOS, PAD, SEP):
@@ -206,23 +212,26 @@ def tokens_to_midi(tokens, output_path, ticks_per_beat=480):
         pitch, time_shift, duration = event
         start_tick = current_tick + time_shift
         end_tick = start_tick + duration
-        # 转换为秒（120 BPM, tpb=480）
+        notes.append((pitch + 21, start_tick, end_tick))
+        current_tick = start_tick
+    return notes
+
+def notes_to_midi(notes, output_path, ticks_per_beat=480):
+    pm = pretty_midi.PrettyMIDI(initial_tempo=120, resolution=ticks_per_beat)
+    inst = pretty_midi.Instrument(program=0)
+    for pitch, start_tick, end_tick in notes:
         start_time = start_tick / (2 * ticks_per_beat)
         end_time = end_tick / (2 * ticks_per_beat)
-        note = pretty_midi.Note(velocity=64, pitch=pitch + 21, start=start_time, end=end_time)
-        piano.notes.append(note)
-        current_tick = start_tick
-
-    pm.instruments.append(piano)
+        inst.notes.append(pretty_midi.Note(velocity=70, pitch=pitch, start=start_time, end=end_time))
+    pm.instruments.append(inst)
     pm.write(output_path)
-    print(f"Generated MIDI saved to {output_path}")
 
 # --- 主程序 ---
 if __name__ == "__main__":
     device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # === 关键：使用与训练完全一致的模型架构 ===
+    # 加载模型
     model = MusicTransformerDecoder(
         vocab_size=VOCAB_SIZE,
         d_model=256,
@@ -235,22 +244,22 @@ if __name__ == "__main__":
     model.to(device)
     print(f"Model loaded from {MODEL_PATH}")
 
-    # 加载输入 MIDI
-    input_events = midi_to_events(INPUT_MIDI_PATH)
-    if input_events is None:
-        raise ValueError(f"Failed to parse input MIDI: {INPUT_MIDI_PATH}")
+    # 加载旋律
+    melody_events = midi_to_melody_events(INPUT_MELODY_PATH)
+    if melody_events is None:
+        raise ValueError(f"Failed to parse melody MIDI: {INPUT_MELODY_PATH}")
 
-    # 构建上下文：仅 [BOS, token1, token2, ...]，不加 EOS
-    input_tokens = [BOS]
-    for pitch, ts, dur in input_events:
-        input_tokens.append(event_to_single_token(pitch, ts, dur))
+    # 构建输入序列（仅用于上下文，实际生成时不输入！）
+    melody_tokens = [BOS]
+    for pitch, ts, dur in melody_events:
+        melody_tokens.append(event_to_single_token(pitch, ts, dur))
+    melody_tokens.append(EOS)
+    print(f"Melody length: {len(melody_tokens)} tokens")
 
-    print(f"Input context length: {len(input_tokens)} tokens")
-
-    # 生成
-    generated_tokens = generate(
+    # 生成伴奏（目标序列）
+    accompaniment_tokens = generate_accompaniment(
         model=model,
-        context_tokens=input_tokens,
+        melody_tokens=melody_tokens,  # 实际未用于生成输入，仅保留接口
         max_generate_tokens=MAX_GENERATE_TOKENS,
         temperature=TEMPERATURE,
         top_k=TOP_K,
@@ -259,5 +268,19 @@ if __name__ == "__main__":
         repetition_penalty_window=REPETITION_PENALTY_WINDOW
     )
 
-    # 保存
-    tokens_to_midi(generated_tokens, OUTPUT_MIDI_PATH)
+    # 保存仅伴奏
+    accompaniment_notes = tokens_to_notes(accompaniment_tokens)
+    if accompaniment_notes:
+        notes_to_midi(accompaniment_notes, OUTPUT_ACCOMPANIMENT_PATH)
+        print(f"Accompaniment saved to {OUTPUT_ACCOMPANIMENT_PATH}")
+    else:
+        print("No notes generated for accompaniment.")
+
+    # 保存完整（旋律 + 伴奏）
+    melody_notes = tokens_to_notes(melody_tokens)
+    full_notes = melody_notes + accompaniment_notes
+    if full_notes:
+        notes_to_midi(full_notes, OUTPUT_FULL_PATH)
+        print(f"Full harmony (melody + accompaniment) saved to {OUTPUT_FULL_PATH}")
+    else:
+        print("No notes for full output.")
