@@ -88,18 +88,6 @@ def separate_voices(notes):
     voices.sort(key=lambda v: -max(n.pitch for n in v))
     return voices
 
-# --- 保存分声部 MIDI（调试）---
-def save_voices_to_midi(voices, output_dir, base_name="voice"):
-    os.makedirs(output_dir, exist_ok=True)
-    for i, voice in enumerate(voices):
-        pm = pretty_midi.PrettyMIDI(initial_tempo=120, resolution=480)
-        inst = pretty_midi.Instrument(program=0)
-        inst.notes = sorted([n for n in voice if 21 <= n.pitch <= 108], key=lambda n: n.start)
-        if inst.notes:
-            pm.instruments.append(inst)
-            pm.write(os.path.join(output_dir, f"{base_name}_voice_{i}.mid"))
-    print(f"Saved {len([v for v in voices if v])} non-empty voices to {output_dir}")
-
 # --- MIDI 转多声部事件 ---
 def midi_to_voices_events(midi_path):
     try:
@@ -137,8 +125,8 @@ def midi_to_voices_events(midi_path):
             voices_events.append(events)
     return voices_events if len(voices_events) >= 2 else None
 
-# --- 多进程处理：生成条件样本 ---
-def process_midi_file_for_harmony(args):
+# --- 多进程处理：生成层级样本 ---
+def process_midi_file_for_hierarchy(args):
     path, max_seq_len, slide_step = args
     voices_events = midi_to_voices_events(path)
     if voices_events is None:
@@ -147,30 +135,48 @@ def process_midi_file_for_harmony(args):
     all_samples = []
     num_voices = len(voices_events)
 
-    for i in range(num_voices):
-        # 输入：声部 i
+    # 声部 0（最高）：自回归
+    melody_tokens = [BOS]
+    for pitch, ts, dur in voices_events[0]:
+        melody_tokens.append(event_to_single_token(pitch, ts, dur))
+    melody_tokens.append(EOS)
+
+    # 切分旋律（自回归样本）
+    start = 0
+    while start < len(melody_tokens):
+        in_chunk = melody_tokens[start:start + max_seq_len]
+        tgt_chunk = melody_tokens[start + 1:start + max_seq_len + 1]  # 目标是下一个token
+        if len(in_chunk) < max_seq_len:
+            in_chunk += [PAD] * (max_seq_len - len(in_chunk))
+        if len(tgt_chunk) < max_seq_len:
+            tgt_chunk += [PAD] * (max_seq_len - len(tgt_chunk))
+        all_samples.append((in_chunk, tgt_chunk))
+        start += slide_step
+        if start >= len(melody_tokens):
+            break
+
+    # 声部 1 到 N-1（条件生成）
+    for i in range(1, num_voices):
+        # 输入：声部 0（旋律）
         input_tokens = [BOS]
-        for pitch, ts, dur in voices_events[i]:
+        for pitch, ts, dur in voices_events[0]:
             input_tokens.append(event_to_single_token(pitch, ts, dur))
         input_tokens.append(EOS)
 
-        # 目标：其他所有声部（拼接）
+        # 目标：声部 i
         target_tokens = [BOS]
-        for j in range(num_voices):
-            if j == i:
-                continue
-            for pitch, ts, dur in voices_events[j]:
-                target_tokens.append(event_to_single_token(pitch, ts, dur))
+        for pitch, ts, dur in voices_events[i]:
+            target_tokens.append(event_to_single_token(pitch, ts, dur))
         target_tokens.append(EOS)
 
-        # 滑动窗口切分（对齐长度）
+        # 滑动窗口对齐
         min_len = min(len(input_tokens), len(target_tokens))
-        if min_len <= 2:  # 只有 BOS/EOS
+        if min_len <= 2:
             continue
         start = 0
         while start < min_len:
             in_chunk = input_tokens[start:start + max_seq_len]
-            tgt_chunk = target_tokens[start:start + max_seq_len]
+            tgt_chunk = target_tokens[start + 1:start + max_seq_len + 1]  # 目标是下一个token
             if len(in_chunk) < max_seq_len:
                 in_chunk += [PAD] * (max_seq_len - len(in_chunk))
             if len(tgt_chunk) < max_seq_len:
@@ -183,7 +189,7 @@ def process_midi_file_for_harmony(args):
     return all_samples
 
 # --- 数据集 ---
-class HarmonyMIDIDataset(Dataset):
+class HierarchyMIDIDataset(Dataset):
     def __init__(self, root_dir, max_seq_len, slide_step, num_workers, split='train'):
         file_paths = []
         for ext in ['*.mid', '*.midi']:
@@ -199,7 +205,7 @@ class HarmonyMIDIDataset(Dataset):
         args_list = [(path, max_seq_len, slide_step) for path in file_paths]
         print(f"Preprocessing with {num_workers} workers...")
         with mp.Pool(processes=num_workers) as pool:
-            results = list(tqdm(pool.imap_unordered(process_midi_file_for_harmony, args_list),
+            results = list(tqdm(pool.imap_unordered(process_midi_file_for_hierarchy, args_list),
                                total=len(args_list), desc=f"Processing {split}"))
 
         self.samples = []
@@ -253,6 +259,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
     total_loss = 0
     for batch_inp, batch_tgt in tqdm(dataloader, desc="Training"):
         batch_inp, batch_tgt = batch_inp.to(device), batch_tgt.to(device)
+        # 输入: [BOS, t1, t2, ...]
+        # 目标: [t1, t2, ..., EOS]
         x = batch_inp[:, :-1]
         y = batch_tgt[:, 1:]
 
@@ -290,33 +298,12 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # === 调试：保存一个 MIDI 的分声部 ===
-    debug_midi_path = None
-    all_midis = []
-    for ext in ['*.mid', '*.midi']:
-        all_midis.extend(glob.glob(os.path.join(ROOT_DIR, '**', ext), recursive=True))
-    if all_midis:
-        debug_midi_path = all_midis[0]
-        print(f"Debug: processing {debug_midi_path} for voice separation...")
-        try:
-            midi_obj = pretty_midi.PrettyMIDI(debug_midi_path)
-            all_notes = []
-            for inst in midi_obj.instruments:
-                all_notes.extend(inst.notes)
-            voices = separate_voices(all_notes)
-            if voices:
-                save_voices_to_midi(voices, "debug_voices", os.path.basename(debug_midi_path).split('.')[0])
-            else:
-                print("No valid voices found in debug MIDI.")
-        except Exception as e:
-            print(f"Failed to process debug MIDI: {e}")
-
     # === 数据集 ===
-    train_dataset = HarmonyMIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS, 'train')
-    val_dataset = HarmonyMIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS, 'val')
+    train_dataset = HierarchyMIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS, 'train')
+    val_dataset = HierarchyMIDIDataset(ROOT_DIR, MAX_SEQ_LEN, SLIDE_STEP, NUM_WORKERS, 'val')
 
     if len(train_dataset) == 0:
-        raise ValueError("No valid training samples generated. Check MIDI files and voice separation.")
+        raise ValueError("No valid training samples generated.")
 
     train_dataloader = DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
     val_dataloader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=0)
@@ -349,7 +336,7 @@ if __name__ == "__main__":
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), "best_harmony_model.pt")
+            torch.save(model.state_dict(), "best_hierarchy_model.pt")
             print("  → New best model saved!")
         else:
             patience_counter += 1
@@ -357,4 +344,4 @@ if __name__ == "__main__":
                 print(f"Early stopping at epoch {epoch+1}.")
                 break
 
-    print("\nTraining finished. Best model: 'best_harmony_model.pt'")
+    print("\nTraining finished. Best model: 'best_hierarchy_model.pt'")

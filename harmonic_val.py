@@ -6,10 +6,9 @@ import numpy as np
 from tqdm import tqdm
 
 # --- 配置参数 ---
-MODEL_PATH = "best_harmony_model.pt"
-INPUT_MELODY_PATH = "2.mid"          # 输入旋律 MIDI
-OUTPUT_ACCOMPANIMENT_PATH = "accompaniment.mid"  # 仅伴奏
-OUTPUT_FULL_PATH = "full_harmony.mid"     # 旋律 + 伴奏
+MODEL_PATH = "best_hierarchy_model.pt"
+INPUT_MELODY_PATH = "3.mid"          # 输入旋律 MIDI
+OUTPUT_FULL_PATH = "hierarchical_harmony.mid"     # 完整和声
 
 MAX_SEQ_LEN = 2048
 MAX_GENERATE_TOKENS = 2048
@@ -71,7 +70,6 @@ def midi_to_melody_events(midi_path):
     if not notes:
         return None
 
-    # 保留钢琴范围
     notes = [n for n in notes if 21 <= n.pitch <= 108]
     if not notes:
         return None
@@ -111,7 +109,7 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
 def apply_repetition_penalty(logits, generated_tokens, penalty, window_size):
     if len(generated_tokens) == 0:
         return logits
-    recent_tokens = list(set(generated_tokens[-window_size:]))  # 去重
+    recent_tokens = list(set(generated_tokens[-window_size:]))
     for token_id in recent_tokens:
         if 0 <= token_id < logits.size(0):
             logits[token_id] /= penalty
@@ -148,27 +146,23 @@ def generate_square_subsequent_mask(sz):
     mask = torch.triu(torch.ones(sz, sz), diagonal=1)
     return mask.masked_fill(mask == 1, float('-inf'))
 
-# --- 生成函数 ---
-def generate_accompaniment(model, melody_tokens, max_generate_tokens, temperature=1.0,
-                          top_k=0, top_p=0.0, repetition_penalty=1.0, repetition_penalty_window=30):
-    model.eval()
+# --- 生成函数（层级）---
+def generate_hierarchical_harmony(model, melody_tokens, num_voices=3, max_generate_tokens=2048,
+                                  temperature=1.0, top_k=0, top_p=0.0, repetition_penalty=1.0,
+                                  repetition_penalty_window=30):
+    """
+    生成层级和声：先生成 melody，再逐层生成低音声部
+    """
     device = next(model.parameters()).device
+    full_harmony_notes = []
 
-    # 输入：旋律序列（带 BOS/EOS）
-    input_seq = torch.tensor(melody_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    # 1. 生成旋律（自回归）
+    print("Generating melody...")
+    melody_input = torch.tensor(melody_tokens, dtype=torch.long, device=device).unsqueeze(0)
+    melody_generated = torch.tensor([BOS], dtype=torch.long, device=device).unsqueeze(0)
 
-    # 生成目标序列（从 BOS 开始）
-    generated = torch.tensor([BOS], dtype=torch.long, device=device).unsqueeze(0)
-
-    for _ in tqdm(range(max_generate_tokens), desc="Generating Accompaniment"):
-        # 当前输入：旋律（固定） + 已生成伴奏（滑动窗口）
-        current_input = input_seq[:, -MAX_SEQ_LEN:]
-        current_target = generated[:, -MAX_SEQ_LEN:]
-
-        # 注意：模型只接收 target 作为输入！
-        # 因为训练时是：input=旋律, target=伴奏 → 模型学习 P(伴奏 | 旋律)
-        # 但在推理时，我们需要自回归生成伴奏，所以输入应为已生成的伴奏
-        x = current_target
+    for _ in tqdm(range(max_generate_tokens), desc="Generating Melody"):
+        x = melody_generated[:, -MAX_SEQ_LEN:]
         seq_len = x.size(1)
         tgt_mask = generate_square_subsequent_mask(seq_len).to(device)
         padding_mask = (x == PAD).to(device)
@@ -180,7 +174,7 @@ def generate_accompaniment(model, melody_tokens, max_generate_tokens, temperatur
         if repetition_penalty != 1.0:
             next_token_logits = apply_repetition_penalty(
                 next_token_logits,
-                generated[0].tolist(),
+                melody_generated[0].tolist(),
                 repetition_penalty,
                 repetition_penalty_window
             )
@@ -190,13 +184,58 @@ def generate_accompaniment(model, melody_tokens, max_generate_tokens, temperatur
         next_token_id = torch.multinomial(probs, num_samples=1).item()
 
         if next_token_id == EOS:
-            print("EOS generated. Stopping.")
             break
 
         next_token_tensor = torch.tensor([[next_token_id]], device=device)
-        generated = torch.cat([generated, next_token_tensor], dim=1)
+        melody_generated = torch.cat([melody_generated, next_token_tensor], dim=1)
 
-    return generated[0].cpu().tolist()
+    melody_tokens_gen = melody_generated[0].cpu().tolist()
+    melody_notes = tokens_to_notes(melody_tokens_gen)
+    full_harmony_notes.extend(melody_notes)
+    print(f"Generated melody with {len(melody_notes)} notes.")
+
+    # 2. 生成低音声部（条件于旋律）
+    for i in range(1, num_voices):
+        print(f"Generating voice {i} (conditioned on melody)...")
+        # 输入：旋律
+        cond_input = torch.tensor(melody_tokens, dtype=torch.long, device=device).unsqueeze(0)
+        # 生成目标：声部 i
+        voice_generated = torch.tensor([BOS], dtype=torch.long, device=device).unsqueeze(0)
+
+        for _ in tqdm(range(max_generate_tokens), desc=f"Generating Voice {i}"):
+            x = voice_generated[:, -MAX_SEQ_LEN:]
+            seq_len = x.size(1)
+            tgt_mask = generate_square_subsequent_mask(seq_len).to(device)
+            padding_mask = (x == PAD).to(device)
+
+            with torch.no_grad():
+                output = model(x, tgt_mask=tgt_mask, tgt_key_padding_mask=padding_mask)
+                next_token_logits = output[0, -1, :] / temperature
+
+            if repetition_penalty != 1.0:
+                next_token_logits = apply_repetition_penalty(
+                    next_token_logits,
+                    voice_generated[0].tolist(),
+                    repetition_penalty,
+                    repetition_penalty_window
+                )
+
+            filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=top_k, top_p=top_p)
+            probs = torch.softmax(filtered_logits, dim=-1)
+            next_token_id = torch.multinomial(probs, num_samples=1).item()
+
+            if next_token_id == EOS:
+                break
+
+            next_token_tensor = torch.tensor([[next_token_id]], device=device)
+            voice_generated = torch.cat([voice_generated, next_token_tensor], dim=1)
+
+        voice_tokens_gen = voice_generated[0].cpu().tolist()
+        voice_notes = tokens_to_notes(voice_tokens_gen)
+        full_harmony_notes.extend(voice_notes)
+        print(f"Generated voice {i} with {len(voice_notes)} notes.")
+
+    return full_harmony_notes
 
 # --- Token 转 MIDI ---
 def tokens_to_notes(tokens):
@@ -249,17 +288,18 @@ if __name__ == "__main__":
     if melody_events is None:
         raise ValueError(f"Failed to parse melody MIDI: {INPUT_MELODY_PATH}")
 
-    # 构建输入序列（仅用于上下文，实际生成时不输入！）
+    # 构建旋律 token
     melody_tokens = [BOS]
     for pitch, ts, dur in melody_events:
         melody_tokens.append(event_to_single_token(pitch, ts, dur))
     melody_tokens.append(EOS)
-    print(f"Melody length: {len(melody_tokens)} tokens")
+    print(f"Input melody length: {len(melody_tokens)} tokens")
 
-    # 生成伴奏（目标序列）
-    accompaniment_tokens = generate_accompaniment(
+    # 生成层级和声
+    full_notes = generate_hierarchical_harmony(
         model=model,
-        melody_tokens=melody_tokens,  # 实际未用于生成输入，仅保留接口
+        melody_tokens=melody_tokens,
+        num_voices=3,  # 生成旋律 + 2 个伴奏声部
         max_generate_tokens=MAX_GENERATE_TOKENS,
         temperature=TEMPERATURE,
         top_k=TOP_K,
@@ -268,19 +308,9 @@ if __name__ == "__main__":
         repetition_penalty_window=REPETITION_PENALTY_WINDOW
     )
 
-    # 保存仅伴奏
-    accompaniment_notes = tokens_to_notes(accompaniment_tokens)
-    if accompaniment_notes:
-        notes_to_midi(accompaniment_notes, OUTPUT_ACCOMPANIMENT_PATH)
-        print(f"Accompaniment saved to {OUTPUT_ACCOMPANIMENT_PATH}")
-    else:
-        print("No notes generated for accompaniment.")
-
-    # 保存完整（旋律 + 伴奏）
-    melody_notes = tokens_to_notes(melody_tokens)
-    full_notes = melody_notes + accompaniment_notes
+    # 保存完整和声
     if full_notes:
         notes_to_midi(full_notes, OUTPUT_FULL_PATH)
-        print(f"Full harmony (melody + accompaniment) saved to {OUTPUT_FULL_PATH}")
+        print(f"Full hierarchical harmony saved to {OUTPUT_FULL_PATH}")
     else:
-        print("No notes for full output.")
+        print("No notes generated.")
